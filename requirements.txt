@@ -1,0 +1,3 @@
+tqdm
+psutil
+boto3

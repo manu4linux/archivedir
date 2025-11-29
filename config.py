@@ -1,5 +1,5 @@
 # ==========================================
-# Turbo Archive Configuration
+# Archivedir Configuration
 # Priority: CLI Args > Config File > Defaults
 # ==========================================
 
@@ -17,11 +17,11 @@ SPLIT_SIZE_GB = 3.5
 
 # Compression Level (1 = Fast, 9 = Small)
 # Default is 1.
-COMPRESSION_LEVEL = 1
+COMPRESSION_LEVEL = 6
 
 # List of patterns to exclude
 # Example: EXCLUDES = ["*.log", "*.tmp", "__pycache__"]
-EXCLUDES = []
+EXCLUDES = ["*.log", "*.tmp", "__pycache__"]
 
 # ==========================================
 # Extraction Configuration
