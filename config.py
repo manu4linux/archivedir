@@ -30,5 +30,29 @@ EXCLUDES = ["*.log", "*.tmp", "__pycache__"]
 # Source pattern for extraction (e.g., "/mnt/usb/data.part_*")
 EXTRACT_SOURCE = None
 
+# ==========================================
+# Encryption Configuration
+# ==========================================
+
+# Enable encryption (True/False)
+# If True, archives will be encrypted with AES-256-CBC
+ENCRYPTION_ENABLED = False
+
+# Encryption password (used for key derivation)
+# Leave as None to prompt interactively during backup/extract
+# WARNING: Storing passwords in config is insecure - use for testing only
+# ENCRYPTION_PASSWORD = None
+ENCRYPTION_PASSWORD = "0123456789abcdef0123456789abcdef"
+
+# Salt for key derivation (hex string, 32 characters = 16 bytes)
+# If None, a random salt will be generated and saved with metadata
+# Example: ENCRYPTION_SALT = "0123456789abcdef0123456789abcdef"
+# ENCRYPTION_SALT = None
+ENCRYPTION_SALT = "0123456789abcdef0123456789abcdef"
+
+# Number of PBKDF2 iterations for key derivation (higher = more secure but slower)
+# Default: 100000 iterations (reasonable balance)
+ENCRYPTION_ITERATIONS = 10000
+
 # Destination folder for extraction
 EXTRACT_DEST = None

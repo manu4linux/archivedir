@@ -6,6 +6,8 @@ Provides methods to authenticate, create folders, upload/download files in strea
 
 import os
 import io
+import threading
+import time
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -162,9 +164,32 @@ def get_or_create_folder(service, folder_name, parent_id=None):
         return create_folder(service, folder_name, parent_id)
 
 
+def get_or_create_folder_path(service, folder_path, parent_id=None):
+    """
+    Get or create a nested folder path (e.g., "Backups/2025/backup_123").
+    Creates intermediate folders as needed.
+    
+    Args:
+        service: Authenticated Drive service
+        folder_path (str): Folder path (e.g., "Backups/2025/backup_123")
+        parent_id (str, optional): Parent folder ID to start from
+    
+    Returns:
+        str: ID of the final folder in the path
+    """
+    path_parts = folder_path.strip('/').split('/')
+    current_parent_id = parent_id
+    
+    for folder_name in path_parts:
+        current_parent_id = get_or_create_folder(service, folder_name, current_parent_id)
+    
+    return current_parent_id
+
+
 def upload_file_streaming(service, file_stream, filename, folder_id=None, mime_type='application/octet-stream', chunk_size_mb=10):
     """
     Upload a file to Google Drive using streaming (resumable upload).
+    Shows progress in a separate thread.
     
     Args:
         service: Authenticated Drive service
@@ -202,12 +227,42 @@ def upload_file_streaming(service, file_stream, filename, folder_id=None, mime_t
             fields='id, name, size, webViewLink'
         )
         
+        # Shared state for progress tracking
+        progress_data = {'progress': 0, 'done': False}
+        progress_lock = threading.Lock()
+        
+        def progress_monitor():
+            """Monitor and display upload progress in separate thread"""
+            while True:
+                with progress_lock:
+                    current_progress = progress_data['progress']
+                    is_done = progress_data['done']
+                
+                if is_done:
+                    break
+                
+                print(f"   📊 Progress: {current_progress}%", end='\r', flush=True)
+                time.sleep(0.1)  # Update every 100ms
+        
+        # Start progress monitoring thread
+        progress_thread = threading.Thread(target=progress_monitor, daemon=True)
+        progress_thread.start()
+        
+        # Upload with progress tracking
         response = None
         while response is None:
             status, response = request.next_chunk()
             if status:
-                progress = int(status.progress() * 100)
-                print(f"   📊 Progress: {progress}%", end='\r')
+                with progress_lock:
+                    progress_data['progress'] = int(status.progress() * 100)
+        
+        # Signal completion to progress thread
+        with progress_lock:
+            progress_data['done'] = True
+            progress_data['progress'] = 100
+        
+        # Wait for progress thread to finish
+        progress_thread.join(timeout=1.0)
         
         print()  # New line after progress
         print(f"✅ Upload complete!")
@@ -219,6 +274,9 @@ def upload_file_streaming(service, file_stream, filename, folder_id=None, mime_t
         return response.get('id')
     
     except HttpError as error:
+        # Ensure progress thread is stopped
+        with progress_lock:
+            progress_data['done'] = True
         print(f"❌ Error uploading file: {error}")
         raise
 

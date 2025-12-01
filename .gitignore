@@ -5,3 +5,7 @@
 __pycache__/
 *.pyc
 *.pyo
+output
+archivedir_exclude_*.txt
+.DS_Store
+gs:/
