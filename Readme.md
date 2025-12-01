@@ -1,5 +1,54 @@
 # **ArchiveDir Tool**
 
+**ArchiveDir** is a high-performance backup utility with two implementations:
+
+1. **archivedir.py** - Pure Python with parallel compression (cross-platform)
+2. **archivedir_fast.py** - Native tar/gzip streaming with cloud support (macOS/Linux)
+
+## **archivedir_fast.py - NEW! Cloud Streaming**
+
+### **Features**
+
+* ✅ **Cloud Streaming:** Direct upload to AWS S3, Google Drive, or OneDrive (NO local disk space needed!)
+* ✅ **Streaming Pipelines:** tar → gzip → split with minimal RAM usage
+* ✅ **Smart Exclusions:** Automatically skips caches, build artifacts, system files
+* ✅ **OneDrive Support:** Auto-detects offline files and triggers downloads
+* ✅ **Multi-part Archives:** Split large backups into manageable chunks
+* ✅ **Progress Logging:** Stage-by-stage progress with file counts
+
+### **Quick Start (Cloud Streaming)**
+
+```bash
+# AWS S3 (no local disk needed!)
+python3 archivedir_fast.py backup \
+  --source /Users/myuser/Documents \
+  --dest s3://my-bucket/backups/2025 \
+  --size 2
+
+# Google Drive
+python3 archivedir_fast.py backup \
+  --source /Users/myuser/Documents \
+  --dest gs://folder_id \
+  --size 2
+
+# OneDrive
+python3 archivedir_fast.py backup \
+  --source /Users/myuser/Documents \
+  --dest onedrive://backups \
+  --size 2
+```
+
+### **Cloud Setup**
+
+See **[CLOUD_SETUP.md](CLOUD_SETUP.md)** for detailed instructions on:
+* AWS credentials configuration
+* Google Drive OAuth setup
+* OneDrive Azure app registration
+
+---
+
+## **archivedir.py - Original Implementation**
+
 **ArchiveDir** is a high-performance, pure Python utility designed to create and extract split, compressed archives. It replaces complex shell pipelines (like tar | pigz | split) with a single, cross-platform script that runs on Windows, Linux, and macOS without external binary dependencies.
 
 ## **Key Features**

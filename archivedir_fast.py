@@ -2,6 +2,12 @@
 """
 Fast Archive Directory Tool - Using native bash commands for better performance
 Leverages system tar, gzip, and pigz for maximum speed
+
+Supports streaming backups to:
+- Local filesystem
+- AWS S3 (s3://bucket/path or --cloud s3)
+- Google Drive (gs://folder or --cloud gdrive)
+- OneDrive (onedrive://folder or --cloud onedrive)
 """
 
 import os
@@ -10,7 +16,31 @@ import argparse
 import subprocess
 import glob
 import time
+import io
 from pathlib import Path
+from urllib.parse import urlparse
+
+# Optional cloud imports (loaded on demand)
+try:
+    import boto3
+    HAS_S3 = True
+except ImportError:
+    HAS_S3 = False
+
+try:
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+    HAS_GDRIVE = True
+except ImportError:
+    HAS_GDRIVE = False
+
+try:
+    from msal import PublicClientApplication
+    import requests
+    HAS_ONEDRIVE = True
+except ImportError:
+    HAS_ONEDRIVE = False
 
 # Default exclusion patterns for problematic files
 DEFAULT_EXCLUSIONS = [
@@ -137,11 +167,11 @@ def get_compression_command(compressor, threads=None):
     else:
         return "gzip"
 
-def create_exclusion_file(exclusions, temp_dir="/tmp"):
+def create_exclusion_file(exclusions, temp_dir="."):
     """Create a temporary file with exclusion patterns for tar --exclude-from"""
     import tempfile
     
-    # Use system temp with automatic cleanup
+    # Use current directory instead of system temp
     fd, temp_file = tempfile.mkstemp(
         dir=temp_dir, 
         prefix="archivedir_exclude_", 
@@ -189,6 +219,223 @@ def should_exclude_path(path, exclusions, base_path):
     except:
         return False
 
+def detect_cloud_destination(dest):
+    """Detect if destination is cloud storage based on path or scheme"""
+    if dest.startswith('s3://'):
+        return 's3', dest[5:]  # Remove s3:// prefix
+    elif dest.startswith('gs://'):
+        return 'gdrive', dest[5:]  # Remove gs:// prefix
+    elif dest.startswith('onedrive://'):
+        return 'onedrive', dest[11:]  # Remove onedrive:// prefix
+    else:
+        return 'local', dest
+
+def stream_to_s3(file_stream, bucket, key, part_size_mb=100):
+    """Stream data to S3 using multipart upload"""
+    if not HAS_S3:
+        raise ImportError("boto3 not installed. Install with: pip install boto3")
+    
+    print(f"☁️  Streaming to S3: s3://{bucket}/{key}")
+    
+    s3_client = boto3.client('s3')
+    
+    # Initiate multipart upload
+    mpu = s3_client.create_multipart_upload(Bucket=bucket, Key=key)
+    upload_id = mpu['UploadId']
+    
+    parts = []
+    part_num = 1
+    chunk_size = part_size_mb * 1024 * 1024
+    
+    try:
+        while True:
+            chunk = file_stream.read(chunk_size)
+            if not chunk:
+                break
+            
+            print(f"   📤 Uploading part {part_num} ({len(chunk) / (1024**2):.1f} MB)...")
+            
+            response = s3_client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                PartNumber=part_num,
+                UploadId=upload_id,
+                Body=chunk
+            )
+            
+            parts.append({
+                'PartNumber': part_num,
+                'ETag': response['ETag']
+            })
+            
+            part_num += 1
+        
+        # Complete multipart upload
+        s3_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
+        
+        print(f"   ✅ Successfully uploaded to S3: {len(parts)} parts")
+        return True
+        
+    except Exception as e:
+        print(f"   ❌ Upload failed: {e}")
+        # Abort multipart upload on failure
+        s3_client.abort_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id
+        )
+        raise
+
+def stream_to_gdrive(file_stream, folder_path, filename):
+    """Stream data to Google Drive using resumable upload"""
+    if not HAS_GDRIVE:
+        raise ImportError("Google API client not installed. Install with: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib")
+    
+    print(f"☁️  Streaming to Google Drive: {filename}")
+    
+    # Import gdrive_helper for authentication and upload
+    try:
+        from gdrive_helper import authenticate, get_or_create_folder, upload_file_streaming
+    except ImportError:
+        raise ImportError("gdrive_helper.py not found. Make sure it's in the same directory.")
+    
+    # Authenticate
+    service = authenticate()
+    
+    # Get or create folder structure
+    folder_id = None
+    if folder_path and folder_path.strip():
+        # Handle nested folder paths like "Backups/2025"
+        folder_parts = folder_path.strip('/').split('/')
+        current_parent = None
+        
+        for folder_name in folder_parts:
+            current_parent = get_or_create_folder(service, folder_name, current_parent)
+        
+        folder_id = current_parent
+    
+    # Create a seekable buffer from the stream
+    print(f"   📥 Reading stream data...")
+    buffer = io.BytesIO()
+    chunk_size = 1024 * 1024  # 1MB chunks
+    total_bytes = 0
+    
+    while True:
+        chunk = file_stream.read(chunk_size)
+        if not chunk:
+            break
+        buffer.write(chunk)
+        total_bytes += len(chunk)
+        if total_bytes % (10 * 1024 * 1024) == 0:  # Progress every 10MB
+            print(f"   📊 Read {total_bytes / (1024**2):.1f} MB...", end='\r')
+    
+    print(f"\n   ✅ Stream buffered: {total_bytes / (1024**2):.1f} MB")
+    buffer.seek(0)  # Reset to beginning for upload
+    
+    # Upload using streaming
+    file_id = upload_file_streaming(
+        service,
+        buffer,
+        filename,
+        folder_id=folder_id,
+        mime_type='application/gzip',
+        chunk_size_mb=10
+    )
+    
+    return file_id
+
+def stream_to_onedrive(file_stream, folder_path, filename):
+    """Stream data to OneDrive using upload session"""
+    if not HAS_ONEDRIVE:
+        raise ImportError("Microsoft Graph not installed. Install with: pip install msal requests")
+    
+    print(f"☁️  Streaming to OneDrive: {folder_path}/{filename}")
+    
+    # Load app configuration
+    import json
+    with open('onedrive_config.json') as f:
+        config = json.load(f)
+    
+    # Get access token using MSAL
+    app = PublicClientApplication(
+        config['client_id'],
+        authority=f"https://login.microsoftonline.com/{config['tenant_id']}"
+    )
+    
+    result = app.acquire_token_interactive(scopes=["Files.ReadWrite.All"])
+    access_token = result['access_token']
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    # Create upload session
+    upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder_path}/{filename}:/createUploadSession"
+    session_response = requests.post(upload_url, headers=headers)
+    upload_session = session_response.json()
+    
+    # Upload in chunks
+    chunk_size = 320 * 1024 * 10  # 3.2 MB (must be multiple of 320 KB)
+    upload_url = upload_session['uploadUrl']
+    
+    file_stream.seek(0, 2)  # Seek to end
+    file_size = file_stream.tell()
+    file_stream.seek(0)  # Seek back to start
+    
+    offset = 0
+    while True:
+        chunk = file_stream.read(chunk_size)
+        if not chunk:
+            break
+        
+        chunk_len = len(chunk)
+        headers = {
+            'Content-Length': str(chunk_len),
+            'Content-Range': f'bytes {offset}-{offset + chunk_len - 1}/{file_size}'
+        }
+        
+        print(f"   📤 Uploading bytes {offset}-{offset + chunk_len - 1}/{file_size}")
+        
+        response = requests.put(upload_url, headers=headers, data=chunk)
+        offset += chunk_len
+    
+    print(f"   ✅ Successfully uploaded to OneDrive")
+    return True
+
+def should_exclude_path(path, exclusions, base_path):
+    """Check if a path matches any exclusion pattern"""
+    try:
+        # Get relative path from base
+        rel_path = os.path.relpath(path, base_path)
+        
+        for pattern in exclusions:
+            # Simple glob-style matching
+            if pattern.endswith('/*'):
+                # Directory wildcard: Library/*
+                prefix = pattern[:-2]
+                if rel_path.startswith(prefix + '/') or rel_path == prefix:
+                    return True
+            elif '*' in pattern:
+                # Wildcard pattern: *.dill
+                import fnmatch
+                if fnmatch.fnmatch(os.path.basename(path), pattern):
+                    return True
+                if fnmatch.fnmatch(rel_path, pattern):
+                    return True
+            else:
+                # Exact match
+                if rel_path == pattern or rel_path.startswith(pattern + '/'):
+                    return True
+        return False
+    except:
+        return False
+
 def fast_backup(args):
     """Fast backup using native tar command"""
     source = args.source
@@ -200,6 +447,12 @@ def fast_backup(args):
     print(f"   Destination: {dest_dir}")
     if size_gb:
         print(f"   Split size: {size_gb} GB per part")
+    
+    # Detect cloud destination
+    cloud_type, cloud_path = detect_cloud_destination(dest_dir)
+    if cloud_type != 'local':
+        print(f"   ☁️  Cloud destination detected: {cloud_type}")
+        print(f"   ☁️  Cloud path: {cloud_path}")
     
     # Validate inputs
     if not os.path.exists(source):
@@ -306,20 +559,57 @@ def fast_backup(args):
             
             # Compression and splitting pipeline
             comp_cmd = get_compression_command(compressor)
-            split_cmd = f"split -b {size_bytes} - \"{base_output}.part_\""
             
-            # Full pipeline command
-            pipeline = f"{' '.join(tar_cmd_parts)} | {comp_cmd} | {split_cmd}"
-            
-            print(f"\n⏳ Running backup pipeline...")
-            print(f"   Command: tar → {compressor} → split")
-            print(f"   Split pattern: {base_output}.part_*")
-            print(f"   💡 Using streaming pipeline (minimal RAM/disk usage)")
-            print(f"   💡 Data flows directly: disk → tar → compress → split → disk")
-            print(f"   🔧 Using --no-xattrs to suppress extended attributes warnings")
-            
-            # Run with minimal buffering for memory efficiency
-            run_command(pipeline, capture_output=False)
+            if cloud_type != 'local':
+                # Cloud streaming mode
+                print(f"\n⏳ Running backup pipeline with cloud streaming...")
+                print(f"   Command: tar → {compressor} → {cloud_type}")
+                print(f"   💡 Streaming directly to cloud (no local disk usage)")
+                print(f"   🔧 Using --no-xattrs to suppress extended attributes warnings")
+                
+                # Start tar+gzip pipeline
+                tar_proc = subprocess.Popen(tar_cmd_parts, stdout=subprocess.PIPE)
+                gzip_proc = subprocess.Popen(
+                    comp_cmd.split(),
+                    stdin=tar_proc.stdout,
+                    stdout=subprocess.PIPE
+                )
+                
+                # Stream to cloud
+                timestamp = int(time.time())
+                cloud_filename = f"{timestamp}_{os.path.basename(source)}.tar{comp_ext}"
+                
+                if cloud_type == 's3':
+                    # Parse bucket and key from cloud_path
+                    parts = cloud_path.split('/', 1)
+                    bucket = parts[0]
+                    key = f"{parts[1]}/{cloud_filename}" if len(parts) > 1 else cloud_filename
+                    stream_to_s3(gzip_proc.stdout, bucket, key)
+                elif cloud_type == 'gdrive':
+                    # cloud_path is the folder path like "Backups/2025" or folder_id
+                    folder_path = cloud_path if cloud_path else ""
+                    stream_to_gdrive(gzip_proc.stdout, folder_path, cloud_filename)
+                elif cloud_type == 'onedrive':
+                    stream_to_onedrive(gzip_proc.stdout, cloud_path, cloud_filename)
+                
+                gzip_proc.wait()
+                tar_proc.wait()
+            else:
+                # Local filesystem mode
+                split_cmd = f"split -b {size_bytes} - \"{base_output}.part_\""
+                
+                # Full pipeline command
+                pipeline = f"{' '.join(tar_cmd_parts)} | {comp_cmd} | {split_cmd}"
+                
+                print(f"\n⏳ Running backup pipeline...")
+                print(f"   Command: tar → {compressor} → split")
+                print(f"   Split pattern: {base_output}.part_*")
+                print(f"   💡 Using streaming pipeline (minimal RAM/disk usage)")
+                print(f"   💡 Data flows directly: disk → tar → compress → split → disk")
+                print(f"   🔧 Using --no-xattrs to suppress extended attributes warnings")
+                
+                # Run with minimal buffering for memory efficiency
+                run_command(pipeline, capture_output=False)
             
             # Find all parts and report
             print(f"\n📊 Stage 7: Analyzing backup results...")
@@ -430,24 +720,51 @@ def check_and_download_onedrive_files(files):
     
     if onedrive_files:
         print(f"\n   📥 Found {len(onedrive_files)} OneDrive offline file(s)")
-        print(f"   💡 Triggering download...")
+        print(f"   💡 Triggering download and waiting for sync...")
         
-        # Use macOS xattr to check OneDrive status and trigger download
+        # Trigger download and wait for files to become available
+        max_wait_time = 300  # 5 minutes maximum wait
+        check_interval = 2   # Check every 2 seconds
+        
         for idx, file_path in enumerate(onedrive_files, 1):
             try:
-                print(f"   [{idx}/{len(onedrive_files)}] Triggering: {os.path.basename(file_path)}")
-                # Use 'cat' command to force OneDrive to download the file
+                print(f"\n   [{idx}/{len(onedrive_files)}] Processing: {os.path.basename(file_path)}")
+                
+                # Trigger download
+                print(f"      🔄 Triggering download...")
                 subprocess.run(['cat', file_path], capture_output=True, timeout=5)
-                print(f"      ✓ Download triggered")
+                
+                # Wait for file to become available (size > 1KB)
+                start_wait = time.time()
+                waited = 0
+                
+                while waited < max_wait_time:
+                    current_size = os.path.getsize(file_path)
+                    
+                    if current_size >= 1024:
+                        # File is now available
+                        print(f"      ✅ Downloaded! Size: {current_size / (1024**2):.1f} MB (waited {waited:.0f}s)")
+                        break
+                    else:
+                        # Still a placeholder, keep waiting
+                        if waited == 0:
+                            print(f"      ⏳ Waiting for OneDrive sync (checking every {check_interval}s)...", end="")
+                        else:
+                            print(f"\r      ⏳ Waiting... {waited:.0f}s elapsed (size: {current_size} bytes)", end="")
+                        
+                        time.sleep(check_interval)
+                        waited = time.time() - start_wait
+                
+                # Check if we timed out
+                if waited >= max_wait_time:
+                    print(f"\r      ⚠️  Timeout after {max_wait_time}s - file may still be syncing")
+                else:
+                    print()  # New line after progress updates
+                    
             except Exception as dl_err:
-                print(f"      ⚠️  Failed: {dl_err}")
+                print(f"      ⚠️  Error: {dl_err}")
         
-        # Give OneDrive time to start downloading
-        print(f"   ⏳ Waiting 2 seconds for OneDrive sync...")
-        import time
-        time.sleep(2)
-        
-        print(f"   ✅ OneDrive file check complete")
+        print(f"\n   ✅ OneDrive file check complete")
     else:
         print(f"   ✅ All files are local or already synced")
 
@@ -599,17 +916,39 @@ def fast_extract(args):
         print(f"✅ Partial extraction may still be successful - check destination folder")
 
 def main():
-    parser = argparse.ArgumentParser(description="Fast Archive Directory Tool using native commands")
+    parser = argparse.ArgumentParser(
+        description="Fast Archive Directory Tool - Stream backups to local/cloud storage",
+        epilog="Examples:\n"
+               "  Local:        --dest /backup/folder\n"
+               "  AWS S3:       --dest s3://bucket/path\n"
+               "  Google Drive: --dest gs://folder_id\n"
+               "  OneDrive:     --dest onedrive://path\n"
+               "\nSee CLOUD_SETUP.md for detailed cloud configuration instructions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Backup command
     backup_parser = subparsers.add_parser('backup', help='Create archive backup')
     backup_parser.add_argument('--source', required=True, help='Source directory to backup')
-    backup_parser.add_argument('--dest', required=True, help='Destination directory for archive')
+    backup_parser.add_argument('--dest', required=True, 
+                              help='Destination: local path, s3://bucket/path, gs://folder_id, or onedrive://path')
     backup_parser.add_argument('--size', type=float, help='Split size in GB (creates multi-part archive)')
     backup_parser.add_argument('--exclude', action='append', help='Additional exclusion patterns')
     backup_parser.add_argument('--include-problematic', action='store_true', help='Include potentially problematic files')
     backup_parser.add_argument('--verbose', action='store_true', help='Verbose output')
+    
+    # Cloud-specific options
+    backup_parser.add_argument('--cloud', choices=['s3', 'gdrive', 'onedrive'], 
+                              help='Explicitly specify cloud provider (auto-detected from dest if using URL scheme)')
+    backup_parser.add_argument('--aws-profile', default='default', 
+                              help='AWS profile name (default: default)')
+    backup_parser.add_argument('--gdrive-credentials', default='gdrive_credentials.json',
+                              help='Google Drive credentials file (default: gdrive_credentials.json)')
+    backup_parser.add_argument('--gdrive-token', default='gdrive_token.json',
+                              help='Google Drive token file (default: gdrive_token.json)')
+    backup_parser.add_argument('--onedrive-config', default='onedrive_config.json',
+                              help='OneDrive configuration file (default: onedrive_config.json)')
     
     # Extract command
     extract_parser = subparsers.add_parser('extract', help='Extract archive')

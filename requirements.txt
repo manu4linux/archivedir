@@ -1,3 +1,23 @@
+# Core dependencies
 tqdm
 psutil
+
+# Cloud storage support (optional)
+# Install only what you need:
+#   For AWS S3: pip install boto3
+#   For Google Drive: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+#   For OneDrive: pip install msal requests
+
+# AWS S3
 boto3
+
+# Google Drive
+google-auth 
+google-auth-oauthlib 
+google-auth-httplib2 
+google-api-python-client
+
+
+# OneDrive (Microsoft Graph)
+msal
+requests
